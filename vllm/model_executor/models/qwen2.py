@@ -101,11 +101,21 @@ class Qwen2MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
         )
-        if hidden_act != "silu":
+        if hidden_act == "silu":
+            self.act_fn = SiluAndMul()
+        elif hidden_act == "relu2":
+            # Relu2AndMul: relu²(gate) * up, same split as SiluAndMul
+            import torch.nn.functional as F
+            class Relu2AndMul:
+                def __call__(self, x):
+                    d = x.shape[-1] // 2
+                    gate, up = x[..., :d], x[..., d:]
+                    return F.relu(gate).pow(2) * up
+            self.act_fn = Relu2AndMul()
+        else:
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu and relu2 are supported."
             )
-        self.act_fn = SiluAndMul()
 
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
