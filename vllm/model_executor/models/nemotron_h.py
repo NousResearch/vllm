@@ -1,5 +1,11 @@
+import os
+
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 # Adapted from https://github.com/vllm-project/vllm/blob/94d8ec8d2bcb4ec55e33022b313c7e978edf05e1/vllm/model_executor/models/bamba.py
 # Copyright 2024 HuggingFace Inc. team. All rights reserved.
@@ -64,9 +70,11 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsMambaPrefixCaching,
     SupportsPP,
@@ -539,7 +547,7 @@ ALL_DECODER_LAYER_TYPES = {
 
 
 @support_torch_compile
-class NemotronHModel(nn.Module):
+class NemotronHModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -578,6 +586,14 @@ class NemotronHModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             len(config.hybrid_override_pattern), get_layer, prefix=f"{prefix}.layers"
         )
+
+        # DFlash offline extraction: auto-set aux_hidden_state_layers from env var
+        # This bypasses the need for apply_model() which has serialization issues
+        _dflash_layers = os.environ.get("DFLASH_AUX_HIDDEN_STATE_LAYERS", "")
+        if _dflash_layers:
+            _layers = tuple(int(x) for x in _dflash_layers.split(","))
+            self._set_aux_hidden_state_layers(_layers)
+            logger.info("DFlash: auto-set aux_hidden_state_layers=%s from env", _layers)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -605,11 +621,18 @@ class NemotronHModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        # EAGLE3 auxiliary hidden state collection (for DFlash spec decoding)
+        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer)
+        ):
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
+            )
+            self._maybe_add_hidden_state(
+                aux_hidden_states, idx + 1, hidden_states, residual
             )
 
         if not get_pp_group().is_last_rank:
@@ -617,6 +640,8 @@ class NemotronHModel(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
         hidden_states, _ = self.norm_f(hidden_states, residual)
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def is_spec_layer(self, config: NemotronHConfig, weight_name: str) -> bool:
@@ -771,6 +796,7 @@ class NemotronHForCausalLM(
     SupportsQuant,
     MixtureOfExperts,
     SupportsMambaPrefixCaching,
+    SupportsEagle3,
 ):
     # Relevant only if self.has_moe is True
     is_non_gated_moe: bool = True
@@ -919,10 +945,41 @@ class NemotronHForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
-    ):
-        hidden_states = self.model(
+    ) -> torch.Tensor | IntermediateTensors:
+        model_output = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
+
+        # Handle EAGLE3 aux_hidden_states (for offline extraction and DFlash spec decode)
+        if isinstance(model_output, tuple):
+            hidden_states, aux_hidden_states = model_output
+
+            # Extraction mode: save to disk (rank 0 only)
+            _extract_path = os.environ.get("DFLASH_EXTRACT_PATH", "")
+            if _extract_path:
+                import torch.distributed as dist
+                if not dist.is_initialized() or dist.get_rank() == 0:
+                    import safetensors.torch
+                    _num_tokens = hidden_states.shape[0]
+                    stacked = torch.stack(
+                        [t[:_num_tokens].detach().cpu() for t in aux_hidden_states], dim=1
+                    )
+                    _batch_id = id(input_ids) if input_ids is not None else id(hidden_states)
+                    _filename = os.path.join(_extract_path, f"batch_{_batch_id}.safetensors")
+                    if input_ids is not None:
+                        _token_ids = input_ids[:_num_tokens].detach().cpu().reshape(-1)
+                    else:
+                        _token_ids = torch.tensor([], dtype=torch.long)
+                    safetensors.torch.save_file({
+                        "hidden_states": stacked, "token_ids": _token_ids,
+                    }, _filename)
+                # Extraction mode: return just hidden_states
+                return hidden_states
+
+            # DFlash spec decode mode: return the tuple so model runner can extract aux_hidden_states
+            return model_output
+        else:
+            hidden_states = model_output
 
         return hidden_states
 

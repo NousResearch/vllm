@@ -5543,7 +5543,25 @@ class GPUModelRunner(
                 )
 
             if self.use_aux_hidden_state_outputs:
-                hidden_states, _ = outputs
+                # Debug: check what outputs actually is
+                if not isinstance(outputs, tuple):
+                    print(f"DEBUG _dummy_run: use_aux=True but outputs is {type(outputs)}, not tuple", flush=True)
+                    hidden_states = outputs
+                elif len(outputs) != 2:
+                    print(f"DEBUG _dummy_run: outputs has {len(outputs)} elements, expected 2. Types: {[type(o) for o in outputs]}", flush=True)
+                    hidden_states = outputs[0] if len(outputs) > 0 else outputs
+                else:
+                    hs, aux = outputs
+                    print(f"DEBUG _dummy_run: outputs is 2-tuple, hs type={type(hs)}, aux type={type(aux)}", flush=True)
+                    if not isinstance(hs, torch.Tensor):
+                        print(f"DEBUG _dummy_run: hs is NOT a tensor! Trying outputs[0]... type={type(outputs[0])}", flush=True)
+                        # Maybe the model returns (aux_list, hidden_states) instead
+                        if isinstance(aux, torch.Tensor):
+                            hidden_states = aux
+                        else:
+                            hidden_states = hs[0] if isinstance(hs, list) and len(hs) > 0 else hs
+                    else:
+                        hidden_states = hs
             else:
                 hidden_states = outputs
 

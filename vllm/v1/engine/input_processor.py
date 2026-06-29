@@ -455,7 +455,7 @@ class InputProcessor:
                             f"by setting --limit-mm-per-prompt at startup."
                         )
 
-        if prompt_ids and tokenizer is not None:
+        if prompt_ids is not None and len(prompt_ids) > 0 and tokenizer is not None:
             max_input_id = max(prompt_ids, default=0)
 
             # NOTE: tokenizer.max_token_id is the tokenizer’s vocab size while
