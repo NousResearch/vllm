@@ -20,23 +20,64 @@ Reference results below come from a production campaign on Nemotron Ultra 550B (
 TP8, 1× B200 node) where DFlash beat native MTP (k=5) in **all four** production
 concurrency regimes.
 
-## Step 1 — Install this fork
+## Step 1 — Get a working vLLM
+
+There are two paths. The **verified path** is the exact stack behind every certified
+number below; the **fresh-pull path** builds this fork from source.
+
+### Path A — verified reproduction stack (recommended, exact benchmark parity)
+
+The certified numbers were produced with a **vLLM v0.22 container + 2 files from this
+fork bind-mounted over it** (the 0.22 image has the `dflash` method natively; the two
+overlays add the relu2 draft activation and bf16-KV enforcement). On the Nous cluster
+everything already exists — no build step at all:
+
+| Asset | Cluster path |
+| --- | --- |
+| Container (SIF) | `/home/dakota/sif/vllm-v0.22.0.sif` |
+| Overlay patches | `/home/phuc/workspace/rl/small_prs/pr015_dflash_nemotron_ultra/patches_v022/` |
+| **Ready-to-run sbatch, n≤8** (champ-b16, k13) | `.../pr015_dflash_nemotron_ultra/scripts/PROD_serve_dflash_lowconc.sh` |
+| **Ready-to-run sbatch, n≥32** (champ-b8, k5; edit k→3 for n=128) | `.../pr015_dflash_nemotron_ultra/scripts/PROD_serve_dflash_highconc.sh` |
+| Benchmark script (produced all numbers below) | `.../pr015_dflash_nemotron_ultra/scripts/bench_http_compare.py` |
+| Raw bench results + campaign worklog | `.../pr015_dflash_nemotron_ultra/output/bench_http_*.json`, `/home/phuc/workspace/moe/worklogs/2026-07-03/dflash-vs-mtp-nemotron-ultra-550b-benchmark-campaign.md` |
+
+To reproduce the best runs: `sbatch PROD_serve_dflash_lowconc.sh` (or `_highconc`),
+wait for the endpoint file it writes, then run `bench_http_compare.py --max-tokens 512`
+against it directly (never through a router). That is the entire recipe behind the table
+in [Tips](#tips--picking-the-draft-and-k).
+
+The bind-mount lines (already inside the PROD scripts), if you assemble your own launch:
+
+```text
+--bind patches_v022/llm_base_proposer.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/llm_base_proposer.py
+--bind patches_v022/qwen2.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen2.py
+```
+
+### Path B — fresh pull of this fork
 
 ```bash
 git clone https://github.com/NousResearch/vllm.git
 cd vllm
-# main = upstream vllm + DFlash-for-NemotronH commit on top
-uv pip install -e .   # or your usual build path
+# main = upstream vllm + DFlash-for-NemotronH commits on top
+VLLM_USE_PRECOMPILED=1 uv pip install -e .   # or your usual build path
 ```
 
-Alternatively, if you already serve from a stock vLLM container that has the `dflash`
-method registered (e.g. v0.22 SIF images), you only need to overlay two files from this
-fork over the installed package (bind-mount or `PYTHONPATH` shadow):
+Runtime-validated on B200 (greedy outputs verified sensible; see caveats). To match the
+benchmark environment, three environment details matter — all discovered the hard way:
 
-```text
-vllm/v1/spec_decode/llm_base_proposer.py   # dflash plumbing + bf16-KV enforcement
-vllm/model_executor/models/qwen2.py        # relu2 activation
-```
+1. **Driver / torch mismatch:** the precompiled wheel pulls torch cu130; on driver-570
+   (CUDA 12.8) nodes CUDA init fails with "driver too old". Fix: put CUDA 13
+   forward-compat libs (libcuda 580, extractable from any recent NGC/vLLM container's
+   `/usr/local/cuda/compat`) on `LD_LIBRARY_PATH`.
+2. **Pin FlashInfer to the benchmark triplet:** `flashinfer-python==0.6.11.post2
+   flashinfer-cubin==0.6.11.post2 flashinfer-jit-cache==0.6.11.post2+cu130`.
+   The default 0.6.13 resolution (without the jit-cache wheel) segfaulted in fp8_gemm
+   autotuning on this driver combo; the pinned triplet runs the full autotune cleanly,
+   identical to the benchmarked container.
+3. **Keep `--compilation-config '{"pass_config": {"fuse_allreduce_rms": false}}'`**
+   (it is part of the production recipe anyway): vLLM main's fused-allreduce pass calls
+   a newer flashinfer `allreduce_fusion` signature than 0.6.11 provides
+   (`weight_bias` kwarg) and crashes at CUDA-graph capture with it enabled.
 
 ## Step 2 — Get the draft weights
 
@@ -50,6 +91,14 @@ Two production draft checkpoints exist for Nemotron Ultra 550B (internal cluster
 Copy `config.json`, `config.py`, `model-*.safetensors`, `model.safetensors.index.json`
 (~5.6 GB per draft). Skip `optimizer_state_dict.pt` / `scheduler_state_dict.pt` (training
 state, ~6 GB you don't need for inference).
+
+Target models (cluster paths): NVFP4 (all certified numbers)
+`/home/shared/models/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4/`; a BF16 target also
+exists under `.../pr007*/ckpt_real_052726/` (slower at n≤8 — 4× weight bandwidth — use
+NVFP4 to reproduce the table). The working local checkout of this fork lives at
+`/home/phuc/workspace/nous-vllm-fork/` (branch
+`phuc/dflash-nemotron-ultra-v0.20.1-20260629` is the battle-tested v0.20.1 line used for
+early BF16 benches, incl. `DFLASH_MIXED_ATTN=1`; `main` is the current rebased line).
 
 ### b16 vs b8 — what's actually different?
 
@@ -141,13 +190,16 @@ b8@k5/k3) if you serve both.
 - Never set k ≥ the draft's `block_size` (b8: k≤7; b16: k≤15, throughput peak at 13).
 - Keep `dflash_config.mask_token_id` in the draft's `config.json` — the proposer needs it.
 
-### Benchmarking pitfalls
+### Benchmarking (how the table above was measured)
 
+- Tool: `bench_http_compare.py` from the pr015 scripts dir; `--max-tokens 512`,
+  concurrency levels matching the regime (e.g. `--levels 1 8 8 8 8 8` for repeated n=8
+  cells). All numbers are **clean-node medians over ≥3 in-serve reps**.
 - Benchmark direct-to-node, never through a router/load-balancer.
 - Warm up first; short cells (n=8 ≈ 3 s) vary ±15–30 % run-to-run → report medians over ≥3 reps.
 - If tok/s drops while acceptance telemetry (τ) is unchanged, suspect a degraded node, not the model.
 - If the target emits `reasoning_content` (e.g. Nemotron Ultra), your token counting must
-  include it or throughput will look artificially low.
+  include it or throughput will look artificially low (`bench_http_compare.py` handles this).
 
 ## Training your own DFlash draft
 
