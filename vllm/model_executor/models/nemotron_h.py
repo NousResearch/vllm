@@ -798,7 +798,6 @@ class NemotronHForCausalLM(
     SupportsQuant,
     MixtureOfExperts,
     SupportsMambaPrefixCaching,
-    SupportsEagle3,
 ):
     # Relevant only if self.has_moe is True
     is_non_gated_moe: bool = True
