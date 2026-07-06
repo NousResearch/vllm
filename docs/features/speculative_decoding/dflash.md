@@ -36,21 +36,30 @@ everything already exists — no build step at all:
 | --- | --- |
 | Container (SIF) | `/home/dakota/sif/vllm-v0.22.0.sif` |
 | Overlay patches | `/home/phuc/workspace/rl/small_prs/pr015_dflash_nemotron_ultra/patches_v022/` |
-| **Ready-to-run sbatch, n≤8** (champ-b16, k13) | `.../pr015_dflash_nemotron_ultra/scripts/PROD_serve_dflash_lowconc.sh` |
-| **Ready-to-run sbatch, n≥32** (champ-b8, k5; edit k→3 for n=128) | `.../pr015_dflash_nemotron_ultra/scripts/PROD_serve_dflash_highconc.sh` |
-| Benchmark script (produced all numbers below) | `.../pr015_dflash_nemotron_ultra/scripts/bench_http_compare.py` |
-| Raw bench results + campaign worklog | `.../pr015_dflash_nemotron_ultra/output/bench_http_*.json`, `/home/phuc/workspace/moe/worklogs/2026-07-03/dflash-vs-mtp-nemotron-ultra-550b-benchmark-campaign.md` |
+| **Ready-to-run sbatch, n≤8** (champ-b16, k13) | `/home/phuc/workspace/rl/small_prs/pr015_dflash_nemotron_ultra/scripts/PROD_serve_dflash_lowconc.sh` |
+| **Ready-to-run sbatch, n≥32** (champ-b8, k5; edit k→3 for n=128) | `/home/phuc/workspace/rl/small_prs/pr015_dflash_nemotron_ultra/scripts/PROD_serve_dflash_highconc.sh` |
+| Benchmark script (produced all numbers below) | `/home/phuc/workspace/rl/small_prs/pr015_dflash_nemotron_ultra/scripts/bench_http_compare.py` |
+| Raw bench results | `/home/phuc/workspace/rl/small_prs/pr015_dflash_nemotron_ultra/output/bench_http_*.json` |
+| Campaign worklog | `/home/phuc/workspace/moe/worklogs/2026-07-03/dflash-vs-mtp-nemotron-ultra-550b-benchmark-campaign.md` |
 
-To reproduce the best runs: `sbatch PROD_serve_dflash_lowconc.sh` (or `_highconc`),
-wait for the endpoint file it writes, then run `bench_http_compare.py --max-tokens 512`
-against it directly (never through a router). That is the entire recipe behind the table
-in [Tips](#tips--picking-the-draft-and-k).
+To reproduce the best runs:
+
+```bash
+sbatch /home/phuc/workspace/rl/small_prs/pr015_dflash_nemotron_ultra/scripts/PROD_serve_dflash_lowconc.sh   # or PROD_serve_dflash_highconc.sh
+# endpoint is written to /home/phuc/workspace/rl/small_prs/pr015_dflash_nemotron_ultra/output/PROD_dflash_lowconc_endpoint.txt
+python /home/phuc/workspace/rl/small_prs/pr015_dflash_nemotron_ultra/scripts/bench_http_compare.py \
+  --url "http://$(cat /home/phuc/workspace/rl/small_prs/pr015_dflash_nemotron_ultra/output/PROD_dflash_lowconc_endpoint.txt)/v1" \
+  --model dflash-nvfp4-ultra --max-tokens 512
+```
+
+Bench directly against the node (never through a router). That is the entire recipe
+behind the table in [Tips](#tips--picking-the-draft-and-k).
 
 The bind-mount lines (already inside the PROD scripts), if you assemble your own launch:
 
 ```text
---bind patches_v022/llm_base_proposer.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/llm_base_proposer.py
---bind patches_v022/qwen2.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen2.py
+--bind /home/phuc/workspace/rl/small_prs/pr015_dflash_nemotron_ultra/patches_v022/llm_base_proposer.py:/usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/llm_base_proposer.py
+--bind /home/phuc/workspace/rl/small_prs/pr015_dflash_nemotron_ultra/patches_v022/qwen2.py:/usr/local/lib/python3.12/dist-packages/vllm/model_executor/models/qwen2.py
 ```
 
 ### Path B — fresh pull of this fork
@@ -94,9 +103,9 @@ state, ~6 GB you don't need for inference).
 
 Target models (cluster paths): NVFP4 (all certified numbers)
 `/home/shared/models/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4/`; a BF16 target also
-exists under `.../pr007*/ckpt_real_052726/` (slower at n≤8 — 4× weight bandwidth — use
-NVFP4 to reproduce the table). The working local checkout of this fork lives at
-`/home/phuc/workspace/nous-vllm-fork/` (branch
+exists at `/home/phuc/workspace/rl/small_prs/pr007_nemotron_ultra_550b_sft/ckpt_real_052726/`
+(slower at n≤8 — 4× weight bandwidth — use NVFP4 to reproduce the table). The working
+local checkout of this fork lives at `/home/phuc/workspace/nous-vllm-fork/` (branch
 `phuc/dflash-nemotron-ultra-v0.20.1-20260629` is the battle-tested v0.20.1 line used for
 early BF16 benches, incl. `DFLASH_MIXED_ATTN=1`; `main` is the current rebased line).
 
@@ -132,7 +141,7 @@ speculative config to dflash, and force the KV cache to bf16.
 Full production example (Nemotron Ultra 550B NVFP4, TP8, 1×B200 node):
 
 ```bash
-vllm serve /path/to/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
+vllm serve /home/shared/models/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
   --trust-remote-code --tensor-parallel-size 8 --enable-expert-parallel \
   --max-num-seqs 128 --max-model-len 1048576 --max-num-batched-tokens 32768 \
   --enable-prefix-caching --enable-chunked-prefill \
@@ -141,9 +150,9 @@ vllm serve /path/to/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4 \
   --enable-mamba-cache-stochastic-rounding --mamba-cache-philox-rounds 5 \
   --compilation-config '{"pass_config": {"fuse_allreduce_rms": false}}' \
   --tool-call-parser qwen3_coder --enable-auto-tool-choice \
-  --reasoning-parser-plugin /path/to/target/ultra_v3_reasoning_parser.py \
+  --reasoning-parser-plugin /home/shared/models/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4/ultra_v3_reasoning_parser.py \
   --reasoning-parser ultra_v3 \
-  --speculative-config '{"model": "/path/to/draft/checkpoint_best", "method": "dflash", "num_speculative_tokens": 13}' \
+  --speculative-config '{"model": "/home/phuc/workspace/rl/small_prs/pr015_dflash_nemotron_ultra/output/champ_b16_100k_paperopt/checkpoints/checkpoint_best", "method": "dflash", "num_speculative_tokens": 13}' \
   --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 96}' \
   --host 0.0.0.0 --port 8000 --served-model-name dflash-nvfp4-ultra
 ```
@@ -192,9 +201,9 @@ b8@k5/k3) if you serve both.
 
 ### Benchmarking (how the table above was measured)
 
-- Tool: `bench_http_compare.py` from the pr015 scripts dir; `--max-tokens 512`,
-  concurrency levels matching the regime (e.g. `--levels 1 8 8 8 8 8` for repeated n=8
-  cells). All numbers are **clean-node medians over ≥3 in-serve reps**.
+- Tool: `/home/phuc/workspace/rl/small_prs/pr015_dflash_nemotron_ultra/scripts/bench_http_compare.py`;
+  `--max-tokens 512`, concurrency levels matching the regime (e.g. `--levels 1 8 8 8 8 8`
+  for repeated n=8 cells). All numbers are **clean-node medians over ≥3 in-serve reps**.
 - Benchmark direct-to-node, never through a router/load-balancer.
 - Warm up first; short cells (n=8 ≈ 3 s) vary ±15–30 % run-to-run → report medians over ≥3 reps.
 - If tok/s drops while acceptance telemetry (τ) is unchanged, suspect a degraded node, not the model.
