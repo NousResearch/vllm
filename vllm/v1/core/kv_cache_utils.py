@@ -661,9 +661,16 @@ def resolve_kv_cache_block_sizes(
     # Block hashes are only consumed by prefix caching and KV connectors
     # (P/D, offloading); when neither is active, keep hash_block_size equal
     # to the scheduler block size.
+    # NOUS (dflash fp8-KV): back off to the GCD of group block sizes rather
+    # than the LCM (scheduler_block_size). kv_cache_coordinator asserts every
+    # group's block_size is divisible by hash_block_size, which the LCM
+    # violates whenever group block sizes differ (LCM > min). The GCD divides
+    # every group by construction and equals the LCM in the uniform case, so
+    # behaviour is unchanged for homogeneous groups.
+    hash_backoff = math.gcd(*group_block_sizes)
     connector_enabled = vllm_config.kv_transfer_config is not None
     if not (cache_config.enable_prefix_caching or connector_enabled):
-        return scheduler_block_size, scheduler_block_size
+        return scheduler_block_size, hash_backoff
 
     # Mamba groups with block_size != cache_config.block_size
     # (mamba_cache_mode != "align") break divisibility; back off to the
@@ -673,7 +680,7 @@ def resolve_kv_cache_block_sizes(
         and g.kv_cache_spec.block_size != cache_config.block_size
         for g in groups
     ):
-        return scheduler_block_size, scheduler_block_size
+        return scheduler_block_size, hash_backoff
 
     requested = cache_config.prefix_match_unit
     hash_block_size = (
@@ -1091,6 +1098,65 @@ def unify_kv_cache_spec_page_size(
         return kv_cache_spec
 
     max_page_size = max(page_sizes)
+    # NOUS (dflash fp8-KV): when some specs are already padded (e.g. Mamba
+    # pages platform-aligned to the target attention page), prefer their page
+    # size as the unification target and DOWN-scale divisible larger pages
+    # (e.g. a bf16 draft page that is 2x the fp8 target page) instead of
+    # padding everything up to the largest page. Padding up re-pads every
+    # Mamba page to the draft's page size, wasting ~50% of the state cache
+    # on Mamba-heavy hybrids; down-scaling the handful of draft layers is
+    # free. Falls back to upstream behaviour when no spec is padded or the
+    # ratio is not integer.
+    padded_sizes = {
+        layer.page_size_bytes
+        for layer in kv_cache_spec.values()
+        if getattr(layer, "page_size_padded", None) is not None
+    }
+    if len(padded_sizes) == 1:
+        anchor_page_size = padded_sizes.pop()
+        if anchor_page_size < max_page_size and all(
+            layer.page_size_bytes % anchor_page_size == 0
+            and (
+                layer.page_size_bytes == anchor_page_size
+                or getattr(layer, "page_size_padded", None) is None
+            )
+            and (
+                layer.page_size_bytes <= anchor_page_size
+                or layer.block_size % (layer.page_size_bytes // anchor_page_size)
+                == 0
+            )
+            for layer in kv_cache_spec.values()
+        ):
+            new_kv_cache_spec = {}
+            for layer_name, layer_spec in kv_cache_spec.items():
+                layer_page_size = layer_spec.page_size_bytes
+                if layer_page_size == anchor_page_size:
+                    new_kv_cache_spec[layer_name] = layer_spec
+                elif layer_page_size < anchor_page_size:
+                    ratio = anchor_page_size // layer_page_size
+                    down_spec = replace(
+                        layer_spec, block_size=layer_spec.block_size * ratio
+                    )
+                    assert down_spec.page_size_bytes == anchor_page_size
+                    new_kv_cache_spec[layer_name] = down_spec
+                else:
+                    ratio = layer_page_size // anchor_page_size
+                    down_spec = replace(
+                        layer_spec, block_size=layer_spec.block_size // ratio
+                    )
+                    assert down_spec.page_size_bytes == anchor_page_size
+                    logger.info(
+                        "Unified page size by down-scaling %s block_size "
+                        "%d -> %d (page %d -> %d bytes).",
+                        layer_name,
+                        layer_spec.block_size,
+                        down_spec.block_size,
+                        layer_page_size,
+                        anchor_page_size,
+                    )
+                    new_kv_cache_spec[layer_name] = down_spec
+            return new_kv_cache_spec
+
     new_kv_cache_spec = {}
     for layer_name, layer_spec in kv_cache_spec.items():
         if layer_spec.page_size_bytes == max_page_size:
