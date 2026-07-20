@@ -607,9 +607,15 @@ def resolve_kv_cache_block_sizes(
     # Block hashes are only consumed by prefix caching and KV connectors
     # (P/D, offloading); when neither is active, keep hash_block_size equal
     # to the scheduler block size.
+    # PATCH (pr023 dflash fp8-KV): the backoff below used to return
+    # scheduler_block_size (the LCM) for hash_block_size, but the KV cache
+    # coordinator asserts every group's block_size is divisible by
+    # hash_block_size — impossible when groups differ (LCM > min). Use the
+    # GCD of group block sizes, which divides every group by construction.
+    hash_backoff = math.gcd(*group_block_sizes)
     connector_enabled = vllm_config.kv_transfer_config is not None
     if not (cache_config.enable_prefix_caching or connector_enabled):
-        return scheduler_block_size, scheduler_block_size
+        return scheduler_block_size, hash_backoff
 
     # Mamba groups with block_size != cache_config.block_size
     # (mamba_cache_mode != "align") break divisibility; back off to the
@@ -619,7 +625,7 @@ def resolve_kv_cache_block_sizes(
         and g.kv_cache_spec.block_size != cache_config.block_size
         for g in groups
     ):
-        return scheduler_block_size, scheduler_block_size
+        return scheduler_block_size, hash_backoff
 
     requested = cache_config.hash_block_size
     hash_block_size = (
@@ -1029,22 +1035,72 @@ def unify_kv_cache_spec_page_size(
         # All layers have the same page size, no need to unify.
         return kv_cache_spec
 
-    max_page_size = max(page_sizes)
+    # PATCH (pr023 dflash fp8-KV): the stock implementation only scales
+    # smaller pages UP to max_page_size. That breaks when a layer with
+    # page_size_padded (e.g. Mamba pages padded to match the target's fp8
+    # attention page) is immovable and a bf16 draft layer holds the max:
+    # replace(block_size=...) cannot change a padded page, so the old
+    # assert fired. Instead, unify toward the page size of the immovable
+    # (padded) specs when present, scaling other layers UP or DOWN by an
+    # integer ratio. Falls back to old behaviour (max) when nothing is
+    # padded.
+    padded_sizes = {
+        layer.page_size_bytes
+        for layer in kv_cache_spec.values()
+        if getattr(layer, "page_size_padded", None) is not None
+    }
+    if len(padded_sizes) > 1:
+        raise NotImplementedError(
+            "Multiple distinct padded page sizes cannot be unified."
+        )
+    target_page_size = padded_sizes.pop() if padded_sizes else max(page_sizes)
+
     new_kv_cache_spec = {}
     for layer_name, layer_spec in kv_cache_spec.items():
-        if layer_spec.page_size_bytes == max_page_size:
+        layer_page_size = layer_spec.page_size_bytes
+        if layer_page_size == target_page_size:
             new_kv_cache_spec[layer_name] = layer_spec
-        else:
-            layer_page_size = layer_spec.page_size_bytes
-            if max_page_size % layer_page_size != 0:
+        elif layer_page_size < target_page_size:
+            # Scale up (stock path).
+            if target_page_size % layer_page_size != 0:
                 raise NotImplementedError(
                     "The page size of the layer is not divisible by the "
-                    "maximum page size. Cannot unify by adjusting block_size."
+                    "target page size. Cannot unify by adjusting block_size."
                 )
-            ratio = max_page_size // layer_page_size
+            ratio = target_page_size // layer_page_size
             new_block_size = layer_spec.block_size * ratio
             new_spec = replace(layer_spec, block_size=new_block_size)
-            assert new_spec.page_size_bytes == max_page_size
+            assert new_spec.page_size_bytes == target_page_size
+            new_kv_cache_spec[layer_name] = new_spec
+        else:
+            # PATCH: scale DOWN a larger page (e.g. bf16 draft layers when
+            # the target runs an fp8 KV cache -> ratio 2).
+            if (
+                layer_page_size % target_page_size != 0
+                or getattr(layer_spec, "page_size_padded", None) is not None
+            ):
+                raise NotImplementedError(
+                    "Cannot unify: larger page is not an integer multiple "
+                    "of the target page size."
+                )
+            ratio = layer_page_size // target_page_size
+            if layer_spec.block_size % ratio != 0:
+                raise NotImplementedError(
+                    "Cannot unify: block_size not divisible by the "
+                    "down-scaling ratio."
+                )
+            new_block_size = layer_spec.block_size // ratio
+            new_spec = replace(layer_spec, block_size=new_block_size)
+            assert new_spec.page_size_bytes == target_page_size
+            logger.info(
+                "Unified page size by DOWN-scaling %s block_size %d -> %d "
+                "(page %d -> %d bytes).",
+                layer_name,
+                layer_spec.block_size,
+                new_block_size,
+                layer_page_size,
+                target_page_size,
+            )
             new_kv_cache_spec[layer_name] = new_spec
     return new_kv_cache_spec
 
